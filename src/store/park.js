@@ -30,6 +30,14 @@ function emptyReservationStats() {
   }
 }
 
+function emptyMemberStats() {
+  return {
+    total: 0, silver: 0, gold: 0, diamond: 0, activeCards: 0, frozen: 0, expiring: 0,
+    pointsOutstanding: 0, balanceLiability: 0, cardRevToday: 0, topupToday: 0,
+    vendorToday: 0, redeemToday: 0, memberOrdersToday: 0
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -59,7 +67,14 @@ export const useParkStore = defineStore('park', {
     reservations: s => s.data?.reservations || [],
     reservationStats: s => s.data?.reservationStats || emptyReservationStats(),
     openComplaints: s => (s.data?.complaints || []).filter(c => ['open', 'processing', 'ready'].includes(c.status)),
-    activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active')
+    activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active'),
+    // 会员与权益
+    members: s => s.data?.members || [],
+    memberStats: s => s.data?.memberStats || emptyMemberStats(),
+    memberConfig: s => s.data?.memberConfig || { enabled: true, pointRate: 1, pointsComp: 300, voucherFace: 30, benefitValidDays: 30 },
+    cardProducts: s => s.data?.cardProducts || [],
+    benefitProducts: s => s.data?.benefitProducts || [],
+    memberSpecialists: s => (s.data?.staff || []).filter(x => x.role === '会员专员')
   },
   actions: {
     async refresh() {
@@ -104,6 +119,20 @@ export const useParkStore = defineStore('park', {
     // 设施检修工单
     assignMaintenance(id, staff_id) { return this.api('POST', `/maintenance/${id}/assign`, { staff_id }) },
     cancelMaintenance(id) { return this.api('POST', `/maintenance/${id}/cancel`, {}) },
-    async maintenanceDetail(id) { return j('GET', `/maintenance/${id}`) }
+    async maintenanceDetail(id) { return j('GET', `/maintenance/${id}`) },
+    // 游客会员与权益中心
+    registerMember(payload) { return this.api('POST', '/members', payload) },
+    applyCard(id, tier, payload) { return this.api('POST', `/members/${id}/cards/${tier}`, payload) },
+    memberTopup(id, amount, request_id) { return this.api('POST', `/members/${id}/topup`, { amount, request_id }) },
+    redeemBenefit(id, code, request_id) { return this.api('POST', `/members/${id}/redeem/${code}`, { request_id }) },
+    buyMemberTicket(id, qty, request_id) { return this.api('POST', `/members/${id}/tickets`, { qty, request_id }) },
+    memberVendorSpend(id, vendorId, payload) { return this.api('POST', `/members/${id}/vendors/${vendorId}/spend`, payload) },
+    freezeMember(id, frozen, reason) { return this.api('POST', `/members/${id}/freeze`, { frozen, reason }) },
+    adjustMemberPoints(id, change, note) { return this.api('POST', `/members/${id}/points`, { change, note }) },
+    setMemberOwner(id, staff_id) { return this.api('POST', `/members/${id}/owner`, { staff_id }) },
+    saveMemberConfig(payload) { return this.api('POST', '/member-config', payload) },
+    updateCardProduct(tier, payload) { return this.api('POST', `/card-products/${tier}`, payload) },
+    async memberDetail(id) { return j('GET', `/members/${id}`) },
+    async memberQuote(id, payload) { return j('POST', `/members/${id}/quote`, payload) }
   }
 })

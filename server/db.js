@@ -258,13 +258,128 @@ CREATE INDEX IF NOT EXISTS idx_maint_logs_oid ON maintenance_logs(order_id);
 -- 幂等请求键：同一 scope+key 的重复请求（双击/重试/网络重发）直接返回首次执行结果，不产生重复副作用
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope TEXT NOT NULL,           -- create / cancel / reschedule / checkin
+  scope TEXT NOT NULL,           -- create / cancel / reschedule / checkin / member_card / member_redeem
   key TEXT NOT NULL,             -- 客户端请求号（UUID）
   response TEXT NOT NULL,        -- 首次执行结果快照（JSON）
   created_tick INTEGER NOT NULL DEFAULT 0,
   created_day INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_idem_scope_key ON idempotency_keys(scope,key);
+
+-- ---------------- 游客会员与权益中心 ----------------
+-- 会员卡商品（运营可配置：银卡/金卡/钻石卡，价格、有效期、折扣、积分倍率、开卡赠权益）
+CREATE TABLE IF NOT EXISTS card_products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tier TEXT NOT NULL UNIQUE,        -- silver/gold/diamond（无卡普通会员 tier=none，不在此表）
+  name TEXT NOT NULL,
+  price INTEGER NOT NULL,           -- 购卡价（¥）
+  valid_days INTEGER NOT NULL,      -- 有效期（游戏日）
+  point_mul REAL NOT NULL DEFAULT 1,-- 积分倍率
+  discount_entry REAL NOT NULL DEFAULT 1,  -- 入园门票折扣（1=不打折，0.9=9 折）
+  discount_ride REAL NOT NULL DEFAULT 1,   -- 设施票价折扣
+  discount_vendor REAL NOT NULL DEFAULT 1, -- 商铺消费折扣
+  give_ticket INTEGER NOT NULL DEFAULT 0,  -- 开卡赠免票券
+  give_voucher INTEGER NOT NULL DEFAULT 0, -- 开卡赠消费券（张，每张面额 voucher_face）
+  give_fastpass INTEGER NOT NULL DEFAULT 0,-- 开卡赠快速通行券
+  bonus_points INTEGER NOT NULL DEFAULT 0, -- 开卡赠送积分
+  active INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- 会员档案（注册即普通会员 none；购卡/升级/到期驱动 card_tier 与状态流转）
+CREATE TABLE IF NOT EXISTS members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- 会员号 HY0001
+  name TEXT NOT NULL DEFAULT '游客',
+  phone TEXT NOT NULL DEFAULT '',
+  card_tier TEXT NOT NULL DEFAULT 'none', -- none/silver/gold/diamond
+  status TEXT NOT NULL DEFAULT 'active',  -- active/frozen/expired（到期由日结扫描置 expired）
+  points INTEGER NOT NULL DEFAULT 0,      -- 当前可用积分
+  total_points INTEGER NOT NULL DEFAULT 0,-- 累计获得积分
+  balance INTEGER NOT NULL DEFAULT 0,     -- 储值余额（¥，充值为负债，消费才确认收入）
+  card_expire_day INTEGER NOT NULL DEFAULT 0, -- 会员卡到期游戏日（0=无卡）
+  join_day INTEGER NOT NULL,
+  owner_staff_id INTEGER,                 -- 归属运营人员（会员专员）
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  last_active_tick INTEGER NOT NULL DEFAULT 0
+);
+-- 空手机号允许多条（散客现场注册），仅对非空手机号唯一
+CREATE UNIQUE INDEX IF NOT EXISTS idx_members_phone ON members(phone) WHERE phone IS NOT NULL AND phone<>'';
+CREATE INDEX IF NOT EXISTS idx_members_status ON members(status, card_tier);
+
+-- 购卡/续费/升级订单（财务入账与对账留痕）
+CREATE TABLE IF NOT EXISTS member_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',          -- HK0001
+  member_id INTEGER NOT NULL,
+  type TEXT NOT NULL,                     -- new/renew/upgrade
+  tier TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  staff_id INTEGER,
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_morders_member ON member_orders(member_id);
+
+-- 积分账户流水（获取/消费/回退/调整/过期，逐条可对账）
+CREATE TABLE IF NOT EXISTS member_point_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  change INTEGER NOT NULL,                -- 正=获取，负=消费/回退
+  balance_after INTEGER NOT NULL,
+  source TEXT NOT NULL,                   -- card/entry/ride/vendor/redeem/refund/adjust/expire/comp
+  ref_type TEXT NOT NULL DEFAULT '',      -- reservation/vendor/order/complaint/benefit
+  ref_id INTEGER,
+  day INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mpoints_member ON member_point_logs(member_id);
+
+-- 积分兑换商品（运营可配置：储值/消费券/免票券/快速通行券）
+CREATE TABLE IF NOT EXISTS benefit_products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,       -- balance/voucher/ticket/fastpass
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,              -- balance/voucher/ticket/fastpass
+  points_cost INTEGER NOT NULL,    -- 兑换所需积分
+  amount INTEGER NOT NULL DEFAULT 0, -- balance/voucher 的面额（¥）；券类为 0
+  qty INTEGER NOT NULL DEFAULT 1,  -- 单次兑换发放数量
+  active INTEGER NOT NULL DEFAULT 1,
+  sort INTEGER NOT NULL DEFAULT 0
+);
+
+-- 会员权益账户（开卡赠送 / 积分兑换所得，逐条核销与退还）
+CREATE TABLE IF NOT EXISTS member_benefits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,               -- balance/voucher/ticket/fastpass
+  source TEXT NOT NULL,             -- card/redeem
+  ref_id INTEGER,                  -- 来源订单/兑换记录
+  amount INTEGER NOT NULL DEFAULT 0,-- 储值/消费券面额（¥）
+  status TEXT NOT NULL DEFAULT 'unused', -- unused/used/expired/refunded
+  expire_day INTEGER NOT NULL DEFAULT 0, -- 到期游戏日（0=随卡；券类固定有效期）
+  used_tick INTEGER NOT NULL DEFAULT 0,
+  used_ref_type TEXT NOT NULL DEFAULT '', -- reservation/vendor
+  used_ref_id INTEGER,
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mbenefits_member ON member_benefits(member_id, status);
+
+-- 会员生命周期时间线（注册/购卡/续费/升级/冻结/解冻/到期/兑换/充值/调整）
+CREATE TABLE IF NOT EXISTS member_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,             -- register/card/renew/upgrade/freeze/unfreeze/expire/redeem/topup/adjust/ticket/vendor
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_mlogs_member ON member_logs(member_id);
 `)
 
 // ---------- 轻量列迁移（兼容老库） ----------
@@ -275,6 +390,11 @@ function ensureColumn(table, col, ddl) {
 // 退款金额/手续费留痕：幂等重放与财务对账
 ensureColumn('reservations', 'refund_amount', "refund_amount INTEGER NOT NULL DEFAULT 0")
 ensureColumn('reservations', 'refund_fee', "refund_fee INTEGER NOT NULL DEFAULT 0")
+// 会员联动：下单会员、支付使用的权益（免票券/快速通行券）、实付积分获取留痕
+ensureColumn('reservations', 'member_id', "member_id INTEGER")
+ensureColumn('reservations', 'benefit_id', "benefit_id INTEGER")
+// 投诉联动：会员本人投诉，可积分补偿结案
+ensureColumn('complaints', 'member_id', "member_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -362,7 +482,9 @@ function seed() {
     ['王强', '维修', 2, 380, 2, 78, 1],
     ['赵敏', '维修', 2, 360, 1, 80, 2],
     ['陈杰', '安保', 3, 320, 1, 82, null],
-    ['刘洋', '保洁', 3, 300, 1, 79, null]
+    ['刘洋', '保洁', 3, 300, 1, 79, null],
+    ['孙莉', '会员专员', 1, 340, 2, 90, null],
+    ['周涛', '会员专员', 1, 340, 1, 84, null]
   ]
   staff.forEach(s => is.run(...s))
 
@@ -378,6 +500,73 @@ function seed() {
     f.run(0, 0, '纪念品', 15000, '昨日纪念品收入')
     f.run(0, 0, '工资', -26000, '昨日工资支出')
     f.run(0, 0, '维护', -9000, '昨日设施维护')
+  }
+
+  // ---------- 会员与权益中心：卡种 / 积分商品 / 全局参数 / 示例会员 ----------
+  const setIf = (k, v) => {
+    if (!getSetting(k)) setSetting(k, String(v))
+  }
+  setIf('memberEnabled', 1)                // 会员体系开关（运营可停用）
+  setIf('pointRate', 1)                    // 每 ¥10 实付 = 1 积分（再乘会员卡倍率）
+  setIf('pointsComp', 300)                 // 投诉积分补偿档：结案赠送积分
+  setIf('voucherFace', 30)                 // 消费券面额（¥）
+  setIf('benefitValidDays', 30)            // 兑换/赠送券类权益有效期（游戏日）
+
+  const ic = db.prepare(`INSERT OR IGNORE INTO card_products
+      (tier,name,price,valid_days,point_mul,discount_entry,discount_ride,discount_vendor,give_ticket,give_voucher,give_fastpass,bonus_points,sort)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+  const cards = [
+    ['silver', '银卡', 299, 30, 1.2, 0.95, 0.95, 0.98, 0, 1, 0, 50, 1],
+    ['gold', '金卡', 699, 60, 1.5, 0.9, 0.9, 0.95, 1, 2, 1, 150, 2],
+    ['diamond', '钻石卡', 1299, 90, 2, 0.85, 0.85, 0.9, 2, 4, 2, 300, 3]
+  ]
+  cards.forEach(c => ic.run(...c))
+
+  const ib = db.prepare(`INSERT OR IGNORE INTO benefit_products(code,name,kind,points_cost,amount,qty,sort)
+      VALUES (?,?,?,?,?,?,?)`)
+  const benefits = [
+    ['balance', '储值 ¥30', 'balance', 500, 30, 1, 1],
+    ['voucher', '消费券 ¥30', 'voucher', 300, 30, 1, 2],
+    ['ticket', '免票券 ×1', 'ticket', 800, 0, 1, 3],
+    ['fastpass', '快速通行券 ×1', 'fastpass', 200, 0, 1, 4]
+  ]
+  benefits.forEach(b => ib.run(...b))
+
+  // 示例会员（新库首日建立；含一名金卡会员便于演示等级与权益流转）
+  if (db.prepare('SELECT COUNT(*) n FROM members').get().n === 0) {
+    const im = db.prepare(`INSERT INTO members(code,name,phone,card_tier,status,points,total_points,balance,card_expire_day,join_day,owner_staff_id,created_tick,last_active_tick)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    const demo = [
+      ['HY0001', '王小雨', '13800000001', 'gold', 'active', 420, 1180, 120, 45, 1, 7, 0, 0],
+      ['HY0002', '李大壮', '13800000002', 'silver', 'active', 80, 260, 0, 20, 1, 8, 0, 0],
+      ['HY0003', '陈小星', '', 'none', 'active', 15, 15, 0, 0, 1, null, 0, 0]
+    ]
+    demo.forEach(m => im.run(...m))
+
+    // 示例购卡订单 + 开卡权益（与卡种配置一致，随卡有效期）
+    const imo = db.prepare(`INSERT INTO member_orders(code,member_id,type,tier,price,staff_id,day,tick,note)
+      VALUES(?,?,?,?,?,?,?,0,?)`)
+    const iben = db.prepare(`INSERT INTO member_benefits(member_id,kind,source,ref_id,amount,status,expire_day,created_tick,created_day)
+      VALUES(?,?,?,?,?,'unused',?,0,1)`)
+    const ipl = db.prepare(`INSERT INTO member_point_logs(member_id,change,balance_after,source,ref_type,ref_id,day,tick,note)
+      VALUES(?,?,?,?,?,?,1,0,?)`)
+    const iml = db.prepare(`INSERT INTO member_logs(member_id,tick,day,hour,action,note,staff_id) VALUES(?,0,1,9,?,?,?)`)
+    // 金卡（会员1）：¥699，60 天到第 60 天（示例设到期日 45），1 免票券 + 2 消费券 + 1 FP，150 开卡分
+    let oid = Number(imo.run('HK0001', 1, 'new', 'gold', 699, 7, 1, '购买金卡').lastInsertRowid)
+    iben.run(1, 'ticket', 'card', oid, 0, 45)
+    iben.run(1, 'voucher', 'card', oid, 30, 45)
+    iben.run(1, 'voucher', 'card', oid, 30, 45)
+    iben.run(1, 'fastpass', 'card', oid, 0, 45)
+    ipl.run(1, 150, 150, 'card', 'order', oid, '购买金卡赠送积分')
+    iml.run(1, 'card', '购买金卡，赠免票券×1、消费券×2、快速通行券×1、150 积分', 7)
+    // 银卡（会员2）：¥299，1 消费券，50 开卡分，到期日 20
+    oid = Number(imo.run('HK0002', 2, 'new', 'silver', 299, 8, 1, '购买银卡').lastInsertRowid)
+    iben.run(2, 'voucher', 'card', oid, 30, 20)
+    ipl.run(2, 50, 50, 'card', 'order', oid, '购买银卡赠送积分')
+    iml.run(2, 'card', '购买银卡，赠消费券×1、50 积分', 8)
+    iml.run(3, 'register', '前台注册会员', null)
+    iml.run(1, 'register', '前台注册会员', 7)
+    iml.run(2, 'register', '前台注册会员', 8)
   }
 }
 seed()

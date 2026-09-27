@@ -69,7 +69,7 @@ function cleanupIdempotencyKeys() {
 
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 
-// 由 index.js 注入共享上下文（时钟、财务、投诉）
+// 由 index.js 注入共享上下文（时钟、财务、投诉；会员联动由 index.js 反向接线）
 const ctx = {
   day: () => num(getSetting('day'), 1),
   hour: () => num(getSetting('hour'), OPEN_HOUR),
@@ -77,7 +77,11 @@ const ctx = {
   cash: () => num(getSetting('cash'), 0),
   ticket: () => num(getSetting('ticket'), 120),
   logFinance: null,
-  createComplaint: null
+  createComplaint: null,
+  // 会员联动：报价（折扣/免票券/快速通行券）、建单后（核销权益+发积分）、退款后（返还权益+回退积分）
+  quoteReservation: null,
+  onReservationBooked: null,
+  onReservationRefunded: null
 }
 export function initReservationContext(deps) {
   Object.assign(ctx, deps)
@@ -173,32 +177,60 @@ function forceRefundByPark(rows, note, complaintInfo = {}) {
 // ---------------- 下单 / 改签 / 退款 ----------------
 // 核心一致性：建单+扣库存+预收款+流水+日志在同一事务提交；库存用条件更新原子扣减，
 // 容量不足/时段关闭时条件更新命中 0 行 → 抛 TxError 整体回滚，不留半完成状态
-function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, source }) {
+function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, source, memberId = null, benefitId = null, fastpass = false }) {
   return runAtomic(() => {
-    // 库存原子校验+扣减：仅当时段开放且余量（容量+超售额度）充足才占用
-    const claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
-                              WHERE id=? AND status='open' AND capacity+oversell-booked_count>=?`)
-      .run(qty, slot.id, qty)
+    // 库存原子校验+扣减：普通单要求真实余位（容量+超售额度）；
+    // 快速通行券单不受真实余位约束，仅受 2 倍总名额的硬上限保护（防极端超卖）
+    let claim
+    if (fastpass) {
+      claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
+                          WHERE id=? AND status='open' AND (capacity+oversell)*2-booked_count>=?`)
+        .run(qty, slot.id, qty)
+    } else {
+      claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
+                          WHERE id=? AND status='open' AND capacity+oversell-booked_count>=?`)
+        .run(qty, slot.id, qty)
+    }
     if (claim.changes === 0) {
       const cur = getSlot(slot.id)
       if (!cur || cur.status !== 'open') throw new TxError(RSV_ERR.SLOT_CLOSED, '该时段已关闭预约')
+      if (fastpass) throw new TxError(RSV_ERR.SLOT_FULL, '该时段快速通道名额也已用尽，请改选其他时段')
       throw new TxError(RSV_ERR.SLOT_FULL,
         `该时段余量不足，仅剩 ${Math.max(0, cur.remain)} 个名额${cur.oversell > 0 ? `（含 ${cur.oversell} 超售额度）` : ''}`)
     }
-    const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,created_tick,created_day)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?)`)
+    const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,created_tick,created_day,member_id,benefit_id)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?,?,?)`)
       .run('', guest_name || '游客', guest_phone || '', scope, rideId, slot.id, slot.day, slot.hour,
-           qty, amount, source || 'guest', ctx.tick(), ctx.day())
+           qty, amount, source || 'guest', ctx.tick(), ctx.day(), memberId, benefitId)
     const id = Number(result.lastInsertRowid)
     const code = 'YY' + String(id).padStart(4, '0')
     db.prepare('UPDATE reservations SET code=? WHERE id=?').run(code, id)
-    // 预收款即时入账（现金制：下单即确认收入，核销不重复收费）
+    // 预收款即时入账（现金制：下单即确认收入，核销不重复收费；免票券 0 元单只做权益核销留痕）
     setSetting('cash', Math.round(ctx.cash() + amount))
-    ctx.logFinance?.(ctx.day(), scope === 'entry' ? '门票' : '游乐', amount,
-      `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人`)
+    if (amount > 0) {
+      ctx.logFinance?.(ctx.day(), scope === 'entry' ? '门票' : '游乐', amount,
+        `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人${memberId ? '（会员）' : ''}${benefitId ? ' · 权益支付' : ''}`)
+    } else {
+      ctx.logFinance?.(ctx.day(), '会员权益', 0, `预约 ${code} · 会员免票券核销（0 元单）`)
+    }
+    // 会员权益核销 + 积分发放（同事务）；抛错整体回滚，不会收了款却把券核销丢了
+    if (memberId && ctx.onReservationBooked) {
+      ctx.onReservationBooked({ reservationId: id, memberId, benefitId, amount, scope })
+    }
     logReservation(id, source === 'auto' ? 'auto_book' : 'create',
-      `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}`)
+      `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}${fastpass ? ' · 快速通行券' : ''}`)
     return { ok: true, id, code }
+  })
+}
+
+// 会员模拟下单入口：金额/快速通行标记已由 members.quoteReservation 核定，库存与权益在同事务保证一致。
+// 不走幂等键（模拟流量每单独立），库存不足/时段关闭直接返回失败由调用方容错跳过。
+export function autoBookMember(slot, { memberId, guestName = '会员', amount = 0, benefitId = null }) {
+  const isFp = benefitId ? db.prepare("SELECT kind FROM member_benefits WHERE id=?").get(benefitId)?.kind === 'fastpass' : false
+  return bookSlot(slot, {
+    guest_name: guestName, qty: 1, amount: num(amount),
+    scope: slot.scope, rideId: slot.ride_id ?? null, source: 'auto',
+    memberId: num(memberId), benefitId: benefitId ?? null, fastpass: isFp
   })
 }
 
@@ -226,8 +258,15 @@ function refundOne(rsv, reason, note, opts = {}) {
   // 退款/取消释放可售名额；refund_count 单独留痕，核销容量不回补
   db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?), refund_count=refund_count+? WHERE id=?')
     .run(rsv.qty, rsv.qty, rsv.slot_id)
+  // 会员退款联动（同事务）：全额退返还券类权益并按退款比例回退积分；当日退 50% 只回退一半积分、券不返还
+  if (rsv.member_id && ctx.onReservationRefunded) {
+    ctx.onReservationRefunded({
+      reservationId: rsv.id, memberId: rsv.member_id, benefitId: rsv.benefit_id || null,
+      amount: rsv.amount, refundAmount: back, fee, reason
+    })
+  }
   logReservation(rsv.id, half ? 'cancel' : 'refund',
-    `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}`)
+    `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}${rsv.benefit_id && !half ? '；会员权益已返还' : ''}`)
 
   if (!opts.skipComplaint && reason === 'overbook' && ctx.createComplaint) {
     const ride = rsv.ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rsv.ride_id) : null
@@ -347,8 +386,11 @@ export function checkinReservation(id, requestId = '') {
       return fail(RSV_ERR.CHECKIN_LATE, '该预约时段已过，未到场将按爽约处理')
     }
     const slot = getSlot(rsv.slot_id)
-    // 容量内放行；落在超售名额且本场容量已满 → 自动改签，失败则全额退款（返回业务提示而非放行）
-    if (slot && slot.checked_count + rsv.qty > slot.capacity) {
+    // 快速通行券会员走快速通道：本场满员也直接放行，不参与超售改签/退款
+    const isFastpass = rsv.benefit_id
+      ? db.prepare("SELECT kind FROM member_benefits WHERE id=?").get(rsv.benefit_id)?.kind === 'fastpass'
+      : false
+    if (!isFastpass && slot && slot.checked_count + rsv.qty > slot.capacity) {
       const alt = findAlternativeSlot(rsv)
       if (alt) {
         const mv = moveToSlot(rsv, alt)
@@ -391,7 +433,11 @@ export function autoCheckin(hour) {
       // 模拟到场率：未到场者留给小时末爽约处理
       if (rsv.source !== 'manual' && Math.random() > CHECKIN_RATE) continue
 
-      const within = slot && slot.checked_count + rsv.qty <= slot.capacity
+      // 快速通行券会员走快速通道：本场满员也直接放行
+      const isFastpass = rsv.benefit_id
+        ? db.prepare("SELECT kind FROM member_benefits WHERE id=?").get(rsv.benefit_id)?.kind === 'fastpass'
+        : false
+      const within = isFastpass || (slot && slot.checked_count + rsv.qty <= slot.capacity)
       if (within) {
         const r = runAtomic(() => { applyCheckin(rsv, slot, 'auto'); return { ok: true } })
         if (!r.ok) { errors++; continue }   // 状态冲突（如刚被人工退款）：跳过本单
@@ -563,20 +609,28 @@ export function updateSlot(id, patch) {
   })
 }
 
-export function listReservations({ status = null, scope = null, day = null, limit = 120 } = {}) {
+export function listReservations({ status = null, scope = null, day = null, limit = 120, memberId = null } = {}) {
   const rides = allRideLite()
   const conds = []
   const vals = []
   if (status) { conds.push('status=?'); vals.push(status) }
   if (scope) { conds.push('scope=?'); vals.push(scope) }
   if (day) { conds.push('slot_day=?'); vals.push(num(day)) }
+  if (memberId) { conds.push('member_id=?'); vals.push(num(memberId)) }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const rows = db.prepare(`SELECT * FROM reservations ${where} ORDER BY id DESC LIMIT ?`).all(...vals, num(limit, 120))
+  const memberRows = db.prepare('SELECT id,code,name,card_tier FROM members').all()
+  const memberMap = new Map(memberRows.map(m => [m.id, m]))
   return rows.map(r => ({
     ...r,
     ride_name: r.ride_id ? (rides.find(x => x.id === r.ride_id)?.name || `设施#${r.ride_id}`) : '',
     scope_name: r.scope === 'entry' ? '分时入园' : '设施预约',
-    status_name: STATUS_NAMES[r.status] || r.status
+    status_name: STATUS_NAMES[r.status] || r.status,
+    member_code: r.member_id ? (memberMap.get(r.member_id)?.code || '') : '',
+    member_name: r.member_id ? (memberMap.get(r.member_id)?.name || '') : '',
+    benefit_kind: r.benefit_id
+      ? (db.prepare('SELECT kind FROM member_benefits WHERE id=?').get(r.benefit_id)?.kind || '')
+      : ''
   }))
 }
 function allRideLite() { return db.prepare('SELECT id,name,status,price FROM rides').all() }
@@ -591,7 +645,9 @@ export function reservationLogs(id) {
 }
 
 // 游客端下单校验入口；requestId 幂等：同一请求号重复提交（双击/重试/刷新重发）只建一单、只收一次款
-export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest', requestId = '' }) {
+// memberId/benefitId：会员下单先经 members.quoteReservation 核价（折扣价/免票券 0 元/快速通行券），
+// 权益核销与积分发放在 bookSlot 同事务内完成，价格与权益任一步失败整体回滚。
+export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest', requestId = '', memberId = null, benefitId = null }) {
   return idempotent('create', requestId, () => {
     const slot = getSlot(num(slotId))
     if (!slot) return fail(RSV_ERR.SLOT_NOT_FOUND, '时段不存在')
@@ -604,9 +660,27 @@ export function createReservation({ scope, rideId, slotId, qty, guest_name, gues
     const q = Math.max(1, Math.min(20, Math.round(num(qty, 1))))
     const ride = scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(slot.ride_id) : null
     if (scope === 'ride' && (!ride || ride.status !== 'operating')) return fail(RSV_ERR.RIDE_UNAVAILABLE, '该设施当前不开放预约')
-    const price = scope === 'entry' ? entryPrice() : ridePrice(ride)
-    const amount = q * price
-    return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source })
+    const basePrice = scope === 'entry' ? entryPrice() : ridePrice(ride)
+
+    // 会员核价：折扣 / 免票券（0 元单）/ 快速通行券（走快速通道名额）
+    let amount = q * basePrice
+    let fastpass = false
+    let mId = memberId ? num(memberId) : null
+    let bId = benefitId ? num(benefitId) : null
+    if (mId) {
+      if (!ctx.quoteReservation) return fail('MEMBER_HOOK_MISSING', '会员服务未就绪，请稍后重试')
+      const quote = ctx.quoteReservation(mId, {
+        scope, rideId: slot.ride_id ?? null, qty: q, benefitId: bId,
+        entryPrice: entryPrice(), ridePrice: ride ? ride.price : 30
+      })
+      if (!quote?.ok) return fail(quote.code || RSV_ERR.RIDE_UNAVAILABLE, quote.msg || '会员核价失败')
+      amount = quote.payable
+      fastpass = quote.benefit?.kind === 'fastpass'
+      bId = quote.benefit?.id ?? null
+    } else {
+      bId = null
+    }
+    return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source, memberId: mId, benefitId: bId, fastpass })
   })
 }
 

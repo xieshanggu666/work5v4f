@@ -70,6 +70,15 @@ const repLabels = Array.from({ length: Math.min(store.visitors.length, 12) }, (_
       <div class="card stat" :class="{ alert: store.reservationStats.oversoldPending }">
         <span>⚠️</span><b :class="store.reservationStats.oversoldPending ? 'money neg' : ''">{{ store.reservationStats.oversoldPending }}</b><em>超售待消化</em>
       </div>
+      <div class="card stat">
+        <span>💳</span><b>{{ store.memberStats.activeCards }}</b><em>有效持卡会员</em>
+      </div>
+      <div class="card stat">
+        <span class="money">¥</span><b class="money">{{ store.memberStats.cardRevToday.toLocaleString() }}</b><em>今日购卡收入</em>
+      </div>
+      <div class="card stat" :class="{ alert: store.memberStats.expiring }">
+        <span>⏳</span><b :class="store.memberStats.expiring ? 'money neg' : ''">{{ store.memberStats.expiring }}</b><em>会员卡即将到期</em>
+      </div>
     </div>
 
     <div class="row">

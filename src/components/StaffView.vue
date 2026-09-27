@@ -9,7 +9,8 @@ const names = ['周明','吴磊','郑爽','冯强','梁静','许文','何琳','�
 const roles = [
   { k: '保安', icon: '🛡️', desc: '维护秩序，减少拥挤投诉' },
   { k: '保洁', icon: '🧹', desc: '维持区域清洁度' },
-  { k: '维修', icon: '🛠️', desc: '负责设施检修' }
+  { k: '维修', icon: '🛠️', desc: '负责设施检修' },
+  { k: '会员专员', icon: '💎', desc: '购卡接待与会员归属运营' }
 ]
 
 const roleDesc = k => roles.find(r => r.k === k)?.desc
@@ -17,7 +18,7 @@ const roleDesc = k => roles.find(r => r.k === k)?.desc
 const wageSum = computed(() => store.staff.filter(s => s.active).reduce((a, b) => a + b.wage, 0))
 
 function hire() {
-  const role = roles[Math.floor(Math.random() * 3)].k
+  const role = roles[Math.floor(Math.random() * roles.length)].k
   store.hire({ name: names[Math.floor(Math.random() * names.length)], role, zone_id: 1 })
   hireOpen.value = false
 }

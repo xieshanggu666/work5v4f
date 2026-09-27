@@ -39,10 +39,59 @@ const guestName = ref('')
 const bookMsg = ref(null)          // { text, ok }
 const booking = ref(false)         // 提交中：禁用按钮防双击
 const selectedSlot = ref(null)
+// 会员联动：选择会员后按卡等级折扣核价；可使用免票券（入园 0 元）/快速通行券（满员可约）
+const memberId = ref(null)
+const quote = ref(null)            // 后端核价结果
+const benefitId = ref(null)
+const memberChoices = computed(() => store.members.filter(m => m.status !== 'frozen'))
+const selectedMember = computed(() => store.members.find(m => m.id === memberId.value) || null)
+// 当前会员可用、且适用于本场景的权益（quote 返回前先按种类粗筛）
+const usableBenefits = computed(() => {
+  const m = selectedMember.value
+  if (!m) return []
+  const out = []
+  if (scope.value === 'entry' && qty.value === 1 && m.benefits.ticket > 0) out.push({ kind: 'ticket', label: '🎟️ 使用免票券（0 元）' })
+  if (m.benefits.fastpass > 0) out.push({ kind: 'fastpass', label: '⚡ 使用快速通行券（满员可约·快速通道）' })
+  return out
+})
+async function refreshQuote() {
+  quote.value = null
+  benefitId.value = null
+  if (!memberId.value || !selectedSlot.value) return
+  const r = await store.memberQuote(memberId.value, {
+    scope: scope.value, ride_id: pickRide.value || undefined,
+    qty: qty.value, benefit_id: null
+  })
+  if (r?.ok) quote.value = r
+}
+watch([memberId, selectedSlot, scope, pickRide, qty], refreshQuote)
+// 免票券仅限 1 人：人数变化或切换到设施场景时自动取消已选免票券
+watch([qty, scope], () => {
+  if (benefitId.value && benefitKind.value === 'ticket' && (qty.value !== 1 || scope.value !== 'entry')) {
+    benefitId.value = null
+    bookMsg.value = null
+    refreshQuote()
+  }
+})
+async function onPickBenefit(kind) {
+  if (!memberId.value || !selectedSlot.value) return
+  if (kind === 'ticket' && qty.value !== 1) { bookMsg.value = { ok: false, text: '免票券限 1 人使用，请将人数改为 1' }; return }
+  // 从后端取该种类一张未用权益 id：通过 members 列表拿不到具体 id，用核价接口让服务端校验
+  // 简化处理：前端不直接持有 benefit id，提交时带种类标记由后端取首张——改为先查档案
+  const d = await store.memberDetail(memberId.value)
+  const b = d?.benefits?.find(x => x.kind === kind && x.status === 'unused' && x.expire_day >= today.value)
+  if (!b) { bookMsg.value = { ok: false, text: '没有可用的该类权益' }; return }
+  const r = await store.memberQuote(memberId.value, {
+    scope: scope.value, ride_id: pickRide.value || undefined, qty: 1, benefit_id: b.id
+  })
+  if (r?.ok && r.benefit) { quote.value = r; benefitId.value = b.id }
+  else bookMsg.value = { ok: false, text: r?.msg || '权益不可用' }
+}
+function clearBenefit() { benefitId.value = null; refreshQuote() }
 // 当前下单意图的幂等键：同一意图的重试/双击复用；意图变化或下单成功后换新键
 const bookReqId = ref(newRequestId())
-// 表单意图一变（时段/日期/类型/设施/人数），旧请求号作废，避免误命中上一次提交结果
-watch([scope, pickRide, dayOffset, selectedSlot, qty], () => { bookReqId.value = newRequestId() })
+// 表单意图一变（时段/日期/类型/设施/人数/会员/权益），旧请求号作废，避免误命中上一次提交结果
+watch([scope, pickRide, dayOffset, selectedSlot, qty, memberId, benefitId], () => { bookReqId.value = newRequestId() })
 
 const rideSlotsMap = ref({})   // rideId -> slots
 const rideSlotsLoading = ref(false)
@@ -72,8 +121,18 @@ const rideSlotsByDay = computed(() => {
 
 const slotsForDay = computed(() => scope.value === 'entry' ? entrySlotsByDay.value : rideSlotsByDay.value)
 const chosenRide = computed(() => store.rides.find(r => r.id === pickRide.value))
-const unitPrice = computed(() => scope.value === 'entry' ? +store.ticket : (chosenRide.value?.price ?? 0))
-const totalPrice = computed(() => unitPrice.value * qty.value)
+// 单价/合计：会员选中后以后端核价为准（卡折扣），否则按散客牌价
+const unitPrice = computed(() => {
+  if (memberId.value && quote.value) return Math.round(quote.value.payable / qty.value)
+  return scope.value === 'entry' ? +store.ticket : (chosenRide.value?.price ?? 0)
+})
+const totalPrice = computed(() => {
+  if (memberId.value && quote.value) return quote.value.payable
+  return unitPrice.value * qty.value
+})
+const earnedPoints = computed(() => memberId.value && quote.value ? quote.value.points : 0)
+const discountMul = computed(() => quote.value ? quote.value.discountMul : 1)
+const benefitKind = computed(() => quote.value?.benefit?.kind || '')
 
 function pickSlot(s) { selectedSlot.value = s }
 function onScopeChange() { selectedSlot.value = null; if (scope.value === 'ride' && !pickRide.value && store.rides.length) pickRide.value = store.rides.find(r => r.status === 'operating')?.id || 0 }
@@ -83,7 +142,11 @@ function slotState(s) {
   if (s.status !== 'open') return { cls: 'closed', text: '已关闭' }
   const now = today.value
   if (s.day < now || (s.day === now && s.hour < store.clock.hour)) return { cls: 'past', text: '已过期' }
-  if (s.remain <= 0) return { cls: 'full', text: '约满' }
+  if (s.remain <= 0) {
+    // 会员持有快速通行券时，满员时段仍可选择（走快速通道名额）
+    if (memberId.value && benefitKind.value === 'fastpass') return { cls: 'open', text: '满员·⚡可约' }
+    return { cls: 'full', text: '约满' }
+  }
   return { cls: 'open', text: `余 ${s.remain}` }
 }
 
@@ -98,13 +161,17 @@ async function submitBook() {
       ride_id: scope.value === 'ride' ? pickRide.value : undefined,
       slot_id: selectedSlot.value.id,
       qty: qty.value,
-      guest_name: guestName.value,
+      guest_name: guestName.value || (selectedMember.value?.name ?? ''),
+      member_id: memberId.value || undefined,
+      benefit_id: benefitId.value || undefined,
       request_id: bookReqId.value                 // 幂等键：重试/双击不会重复下单扣款
     })
     if (r?.ok) {
       bookMsg.value = { text: `预约成功！预约号 ${r.code}，预收 ¥${totalPrice.value.toLocaleString()}，请按时段核销入园`, ok: true }
       guestName.value = ''
       selectedSlot.value = null
+      benefitId.value = null
+      quote.value = null
       bookReqId.value = newRequestId()            // 成功后换新键，下一次提交是新意图
       if (scope.value === 'ride') await loadRideSlots()
     } else {
@@ -274,6 +341,28 @@ function pickDayIf(off) { return today.value + off }
           </div>
         </label>
         <label class="fld">游客姓名（选填）<input v-model="guestName" placeholder="如：王**" maxlength="12" /></label>
+        <label class="fld">会员下单（可选）
+          <select v-model.number="memberId">
+            <option :value="null">散客（不享会员权益）</option>
+            <option v-for="m in memberChoices.slice(0, 80)" :key="m.id" :value="m.id">
+              {{ m.code }} · {{ m.name }} · {{ m.tier_name }} · {{ m.points }} 积分
+            </option>
+          </select>
+        </label>
+        <div class="benefit-box" v-if="selectedMember">
+          <div class="bm-head">
+            <span class="tier-mini">{{ selectedMember.tier_name }}</span>
+            <span class="muted">积分 {{ selectedMember.points }} · 储值 ¥{{ selectedMember.balance }}</span>
+            <span class="muted" v-if="selectedMember.benefits.ticket">🎟️{{ selectedMember.benefits.ticket }}</span>
+            <span class="muted" v-if="selectedMember.benefits.fastpass">⚡{{ selectedMember.benefits.fastpass }}</span>
+          </div>
+          <div class="bm-opts" v-if="usableBenefits.length && selectedSlot">
+            <button type="button" class="ben-chip" :class="{ on: benefitKind === 'ticket' }" @click="onPickBenefit('ticket')">🎟️ 免票券（0 元）</button>
+            <button type="button" class="ben-chip" :class="{ on: benefitKind === 'fastpass' }" @click="onPickBenefit('fastpass')">⚡ 快速通行券</button>
+            <button type="button" class="ben-chip clear" v-if="benefitId" @click="clearBenefit">不使用权益</button>
+          </div>
+          <em class="muted bm-tip" v-else>选择时段后可使用免票券/快速通行券；会员折扣已自动计入报价。</em>
+        </div>
         <label class="fld">人数
           <div class="stepper">
             <button type="button" @click="qty = Math.max(1, qty - 1)">－</button>
@@ -282,9 +371,16 @@ function pickDayIf(off) { return today.value + off }
           </div>
         </label>
         <div class="quote">
-          <span>{{ scope === 'entry' ? '门票单价' : '设施票价' }} <b class="money">¥{{ unitPrice }}</b> / 人</span>
-          <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b></span>
-          <em class="muted">提前取消全额退；当日取消退 50%；爽约不退。预约费用下单即收取。</em>
+          <span v-if="memberId && quote">
+            {{ benefitKind === 'ticket' ? '免票券支付' : '会员折后单价' }}
+            <b class="money">{{ benefitKind === 'ticket' ? '¥0' : '¥' + unitPrice }}</b> / 人
+            <em class="disc" v-if="discountMul < 1">卡等级 {{ Math.round(discountMul * 100) }} 折</em>
+          </span>
+          <span v-else>{{ scope === 'entry' ? '门票单价' : '设施票价' }} <b class="money">¥{{ unitPrice }}</b> / 人</span>
+          <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b>
+            <em class="pts-earn" v-if="memberId && earnedPoints">· 预计获 {{ earnedPoints }} 积分</em>
+          </span>
+          <em class="muted">提前取消全额退；当日取消退 50%；爽约不退。会员全额退款时积分按比例回退、券类权益返还。</em>
         </div>
         <button class="primary wide" :disabled="!selectedSlot || booking" @click="submitBook">
           {{ booking ? '提交中…' : selectedSlot ? `预约 第${selectedSlot.day}天 ${selectedSlot.hour}:00 · ¥${totalPrice.toLocaleString()}` : '请先选择时段' }}
@@ -389,6 +485,9 @@ function pickDayIf(off) { return today.value + off }
               <b>{{ r.code }}</b>
               <span class="badge" :class="statusBadge(r.status).cls">{{ statusBadge(r.status).text }}</span>
               <span class="tag">{{ r.scope_name }}</span>
+              <span class="tag mem" v-if="r.member_id">💎 {{ r.member_code }} {{ r.member_name }}</span>
+              <span class="tag fp" v-if="r.benefit_kind === 'fastpass'">⚡快速通行</span>
+              <span class="tag tk" v-if="r.benefit_kind === 'ticket'">🎟️免票</span>
             </div>
             <div class="meta">
               {{ r.scope === 'ride' ? `🎢 ${r.ride_name} · ` : '🏞️ ' }}
@@ -484,6 +583,21 @@ function pickDayIf(off) { return today.value + off }
 .wide { width: 100%; padding: 11px; }
 .bookmsg { display: block; margin-top: 10px; font-size: 12.5px; color: var(--green); font-style: normal; }
 .bookmsg.err { color: var(--red); }
+
+/* 会员权益 */
+.benefit-box { background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
+.bm-head { display: flex; gap: 10px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+.tier-mini { font-size: 11px; padding: 2px 9px; border-radius: 20px; background: rgba(255,209,102,.16); color: var(--accent2); border: 1px solid rgba(255,209,102,.45); }
+.bm-opts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.ben-chip { font-size: 12px; padding: 5px 12px; }
+.ben-chip.on { border-color: var(--purple); background: rgba(167,139,250,.18); color: #c8b6ff; }
+.ben-chip.clear { color: var(--muted); }
+.bm-tip { font-size: 11px; display: block; margin-top: 6px; }
+.disc { font-style: normal; color: var(--purple); font-size: 11px; margin-left: 6px; }
+.pts-earn { font-style: normal; color: var(--accent2); font-size: 11px; }
+.tag.mem { color: var(--purple); border-color: rgba(167,139,250,.5); }
+.tag.fp { color: var(--blue); border-color: rgba(102,166,255,.5); }
+.tag.tk { color: var(--green); border-color: rgba(109,213,160,.5); }
 
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
 .slot { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 10px; border-radius: 10px; position: relative; text-align: left; }

@@ -36,7 +36,8 @@ const COMP_OPTIONS = [
   { k: 'ticket', name: '赠门票', desc: '成本=当日票价，游客好感较高', costText: '当日票价' },
   { k: 'fastpass', name: '快速通行券', desc: '热门设施免排队，评价明显回升', costText: '¥150' },
   { k: 'voucher', name: '园内消费券', desc: '可回流商铺二次消费', costText: '¥300' },
-  { k: 'cash', name: '现金补偿', desc: '最有诚意，口碑回流最强', costText: '¥600' }
+  { k: 'cash', name: '现金补偿', desc: '最有诚意，口碑回流最强', costText: '¥600' },
+  { k: 'points', name: '会员积分', desc: '仅会员投诉，零现金成本（按运营配置积分档）', costText: '积分', memberOnly: true }
 ]
 
 const statusMeta = st => ({
@@ -82,7 +83,7 @@ async function openDetail(c) {
 function closeDetail() { detail.value = null }
 
 // ---- 前台手动登记 ----
-const blankManual = () => ({ category: 'service', severity: 1, content: '', target_type: '', target_id: '' })
+const blankManual = () => ({ category: 'service', severity: 1, content: '', target_type: '', target_id: '', member_id: null })
 const manual = ref(blankManual())
 const manualMsg = ref('')
 const targetOptions = computed(() => {
@@ -140,6 +141,7 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
               <div class="ci-title">
                 <b>{{ c.title }}</b>
                 <em class="muted">{{ c.code }} · 第{{ c.day }}天提交 · {{ c.target_name || '园区整体' }}<span v-if="c.source==='manual'"> · 前台登记</span></em>
+                <em class="muted" v-if="c.member_code"> · 💎 会员 {{ c.member_code }}（{{ c.member_name }}）</em>
               </div>
               <span class="badge sev" :class="sevCls(c.severity)">{{ c.severity_name }}</span>
               <span class="badge" :class="statusMeta(c.status).cls">{{ statusMeta(c.status).label }}</span>
@@ -167,14 +169,18 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
               </select>
             </div>
 
-            <!-- 待确认补偿：补偿方案 -->
+            <!-- 待确认补偿：补偿方案（会员积分档仅会员投诉可用） -->
             <div class="ci-body" v-else-if="c.status === 'ready'">
               <div class="comps">
-                <button v-for="o in COMP_OPTIONS" :key="o.k" :class="{ on: (compChoice[c.id] || 'apology') === o.k }"
+                <button v-for="o in COMP_OPTIONS" :key="o.k"
+                        :class="{ on: (compChoice[c.id] || 'apology') === o.k, dis: o.memberOnly && !c.member_id }"
+                        :disabled="o.memberOnly && !c.member_id"
+                        :title="o.memberOnly && !c.member_id ? '仅会员本人投诉可积分补偿' : o.desc"
                         @click="compChoice[c.id] = o.k">
-                  <b>{{ o.name }}</b><em>{{ o.costText }}</em>
+                  <b>{{ o.name }}</b><em>{{ o.memberOnly ? `${store.memberConfig.pointsComp} 分` : o.costText }}</em>
                 </button>
               </div>
+              <em class="muted comp-tip" v-if="c.member_code">💎 会员投诉：{{ c.member_code }} {{ c.member_name }}，可使用积分补偿（零现金成本）</em>
             </div>
 
             <!-- 已结案信息 -->
@@ -231,6 +237,12 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
               <option :value="''" disabled>请选择…</option>
               <option v-for="t in targetOptions" :key="t.id" :value="t.id">{{ t.name }}</option>
             </select>
+            <label>会员投诉（可选，可积分补偿结案）
+              <select v-model.number="manual.member_id">
+                <option :value="null">非会员/散客</option>
+                <option v-for="m in store.members.slice(0, 80)" :key="m.id" :value="m.id">{{ m.code }} · {{ m.name }} · {{ m.tier_name }}</option>
+              </select>
+            </label>
             <textarea v-model="manual.content" rows="3" maxlength="200" placeholder="游客原话：排队、卫生、设施、餐饮、服务……"></textarea>
             <button class="primary" @click="submitManual">生成投诉工单</button>
             <em v-if="manualMsg" class="mmsg">{{ manualMsg }}</em>
@@ -341,6 +353,8 @@ const womText = computed(() => `${wom.value > 0 ? '+' : ''}${wom.value.toFixed(1
 .comps { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; }
 .comps button { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px 4px; }
 .comps button.on { border-color: var(--green); background: rgba(109,213,160,.12); }
+.comps button.dis { opacity: .4; }
+.comp-tip { font-size: 11px; margin-top: 6px; display: block; }
 .comps em { font-style: normal; font-size: 11px; color: var(--muted); }
 
 .closed-info { font-size: 13px; }

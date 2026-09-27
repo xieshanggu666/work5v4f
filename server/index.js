@@ -5,7 +5,7 @@ import {
   autoCheckin, expireNoShow, autoBookDemand,
   createReservation, cancelReservation, rescheduleReservation, checkinReservation,
   listSlots, listReservations, reservationLogs, updateSlot, reservationStats,
-  refundReservation
+  refundReservation, autoBookMember
 } from './reservations.js'
 import {
   initMaintenanceContext, backfillMaintenanceOrders, processMaintenance,
@@ -13,6 +13,14 @@ import {
   cancelOrdersByRide, releaseStaffOrders, listMaintenanceOrders,
   maintenanceOrderDetail, maintenanceStats, staffLoad
 } from './maintenance.js'
+import {
+  initMemberContext, bindReservationAutoBook,
+  registerMember, applyCard, topup, redeemPoints, vendorSpend, buyEntryTicket,
+  setFrozen, adjustPoints, setOwner, sweepExpiredCards, autoMemberEconomy,
+  listMembers, memberDetail, listCardProducts, listBenefitProducts,
+  getConfig, saveConfig, updateCardProduct, memberStats, compAwardPoints,
+  quoteReservation as memberQuote, onReservationBooked, onReservationRefund as onReservationRefunded
+} from './members.js'
 
 const app = express()
 app.use(express.json())
@@ -74,6 +82,16 @@ initMaintenanceContext({
   syncRideSlots: (ride) => syncRideSlots(ride),
   linkComplaintsToRide: (rideId, staffId) => linkComplaintsToRide(rideId, staffId)
 })
+
+// 会员与权益中心：时钟 / 现金 / 财务流水
+initMemberContext({ logFinance })
+// 预约 ↔ 会员双向联动：预约侧注入会员报价/下单/退款回调；会员侧绑定会员模拟下单入口
+initReservationContext({
+  quoteReservation: (...args) => memberQuote(...args),
+  onReservationBooked: (...args) => onReservationBooked(...args),
+  onReservationRefunded: (...args) => onReservationRefunded(...args)
+})
+bindReservationAutoBook((slot, payload) => autoBookMember(slot, payload))
 
 // ---------------- 分期贷款 ----------------
 const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
@@ -183,13 +201,14 @@ const COMPLAINT_TPL = {
   missing: ['孩子在园区走失半小时，广播寻人不及时。', '随身包在寄存处丢失，园方互相推诿。', '手机落在设施上，工作人员不配合查找。']
 }
 
-// 补偿方案：score 决定游客满意度，ticket 成本随当日票价浮动
+// 补偿方案：score 决定游客满意度，ticket 成本随当日票价浮动；points 为会员积分补偿（0 现金成本）
 const COMP_OPTIONS = {
   apology:  { name: '真诚道歉', cost: 0,    score: 6 },
   ticket:   { name: '赠门票',   cost: 0,    score: 14 },
   fastpass: { name: '快速通行券', cost: 150, score: 20 },
   voucher:  { name: '消费券',   cost: 300,  score: 26 },
-  cash:     { name: '现金补偿', cost: 600,  score: 34 }
+  cash:     { name: '现金补偿', cost: 600,  score: 34 },
+  points:   { name: '会员积分', cost: 0,    score: 22, memberOnly: true }
 }
 
 function logComplaint(cid, action, note, staffId = null) {
@@ -197,12 +216,13 @@ function logComplaint(cid, action, note, staffId = null) {
     .run(cid, state.tick(), state.day(), state.hour(), action, note || '', staffId)
 }
 
-function createComplaint({ category, severity, title, content, target, source }) {
+function createComplaint({ category, severity, title, content, target, source, memberId = null }) {
   const cat = COMPLAINT_CATS[category] ? category : 'service'
   const sev = Math.max(1, Math.min(3, Math.round(severity || 1)))
-  const r = db.prepare(`INSERT INTO complaints(code,tick,day,category,severity,title,content,target_type,target_id,status,deadline_tick,source)
-                        VALUES(?,?,?,?,?,?,?,?,?,'open',?,?)`)
-    .run('', state.tick(), state.day(), cat, sev, title, content || '', target?.type || '', target?.id ?? null, state.tick() + SEV_SLA[sev], source || 'guest')
+  const r = db.prepare(`INSERT INTO complaints(code,tick,day,category,severity,title,content,target_type,target_id,status,deadline_tick,source,member_id)
+                        VALUES(?,?,?,?,?,?,?,?,?,'open',?,?,?)`)
+    .run('', state.tick(), state.day(), cat, sev, title, content || '', target?.type || '', target?.id ?? null,
+         state.tick() + SEV_SLA[sev], source || 'guest', memberId ?? null)
   const id = Number(r.lastInsertRowid)
   const code = 'TS' + String(id).padStart(4, '0')
   db.prepare('UPDATE complaints SET code=? WHERE id=?').run(code, id)
@@ -352,6 +372,13 @@ function doResolveComplaint(id, compKey, auto = false) {
   if (!c) return { ok: false, msg: '投诉不存在' }
   if (c.status !== 'ready') return { ok: false, msg: '需先指派员工完成现场处置' }
   const opt = COMP_OPTIONS[compKey] || COMP_OPTIONS.apology
+  // 会员积分补偿：仅会员本人投诉可用，0 现金成本，积分由会员中心发放并留痕
+  if (compKey === 'points') {
+    if (!c.member_id) return { ok: false, msg: '积分补偿仅对会员本人投诉生效，请改选其他补偿方案' }
+    const m = db.prepare('SELECT id,status FROM members WHERE id=?').get(c.member_id)
+    if (!m) return { ok: false, msg: '会员档案不存在，无法发放积分补偿' }
+    if (m.status === 'frozen') return { ok: false, msg: '该会员账户已冻结，暂不可发放积分，请解冻后结案' }
+  }
   const cost = compKey === 'ticket' ? state.ticket() : opt.cost
   let cash = state.cash()
   if (cash < cost) return { ok: false, msg: `资金不足，该补偿方案需 ¥${cost.toLocaleString()}` }
@@ -372,11 +399,18 @@ function doResolveComplaint(id, compKey, auto = false) {
   setSetting('wordOfMouth', Math.round(wom * 10) / 10)
   if (st) db.prepare('UPDATE staff SET morale=? WHERE id=?').run(Math.max(20, Math.min(100, st.morale + (rating >= 4 ? 4 : rating === 3 ? 1 : -3))), st.id)
   if (cost > 0) logFinance(state.day(), '补偿', -cost, `投诉 ${c.code}「${opt.name}」`)
+  let pointsAwarded = 0
+  if (compKey === 'points') {
+    // 积分补偿在会员中心独立事务发放（失败不结案，前端可重试）
+    const pr = compAwardPoints(c.member_id, num(getSetting('pointsComp'), 300), c.id, { staffId: st?.id ?? null })
+    if (!pr.ok) return { ok: false, msg: pr.msg || '积分补偿发放失败，请稍后重试' }
+    pointsAwarded = pr.points
+  }
 
   db.prepare(`UPDATE complaints SET status='closed_resolved', compensation=?, comp_cost=?, rating=?, close_reason=?, closed_tick=?, closed_day=? WHERE id=?`)
     .run(compKey, cost, rating, auto ? '超时未确认补偿，系统自动以真诚道歉结案' : '补偿方案确认，游客满意离园', state.tick(), state.day(), id)
-  logComplaint(id, 'resolve', `${auto ? '系统自动' : '确认'}补偿「${opt.name}」${cost ? `，支出 ¥${cost}` : ''}，游客评价 ${rating} 星`, st?.id ?? null)
-  return { ok: true, rating, cost }
+  logComplaint(id, 'resolve', `${auto ? '系统自动' : '确认'}补偿「${opt.name}」${cost ? `，支出 ¥${cost}` : ''}${pointsAwarded ? `，发放 ${pointsAwarded} 积分` : ''}，游客评价 ${rating} 星`, st?.id ?? null)
+  return { ok: true, rating, cost, points: pointsAwarded }
 }
 
 // 不予补偿直接结案：游客不满，声誉与口碑受损
@@ -415,6 +449,8 @@ function linkComplaintsToRide(rideId, staffId) {
 function enrichComplaints(rows) {
   const tick = state.tick()
   const rides = allRides(), vendors = allVendors(), zones = allZones()
+  const memberRows = db.prepare('SELECT id,code,name,card_tier FROM members').all()
+  const memberMap = new Map(memberRows.map(m => [m.id, m]))
   return rows.map(c => {
     const st = c.assignee_id ? db.prepare('SELECT id,name,role,skill,morale FROM staff WHERE id=?').get(c.assignee_id) : null
     const target = c.target_type === 'ride' ? rides.find(r => r.id === c.target_id)
@@ -422,6 +458,7 @@ function enrichComplaints(rows) {
       : c.target_type === 'zone' ? zones.find(z => z.id === c.target_id) : null
     const meta = COMPLAINT_CATS[c.category] || COMPLAINT_CATS.service
     const active = ['open', 'processing'].includes(c.status)
+    const m = c.member_id ? memberMap.get(c.member_id) : null
     return {
       ...c,
       category_name: meta.name,
@@ -432,7 +469,10 @@ function enrichComplaints(rows) {
       assignee_name: st?.name || '',
       assignee_role: st?.role || '',
       role_match: st ? (!meta.roles.length || meta.roles.includes(st.role)) : false,
-      target_name: target?.name || ''
+      target_name: target?.name || '',
+      member_code: m?.code || '',
+      member_name: m?.name || '',
+      member_tier: m?.card_tier || ''
     }
   })
 }
@@ -478,6 +518,13 @@ function tick() {
     cash = settled.cash
     overdueHits = settled.overdueHits
     overdueIds = settled.overdueIds
+    // 会员卡到期日结扫描：过有效期等级降级为普通会员（积分/储值保留），记录状态流转
+    const expiredCards = sweepExpiredCards(day + 1)
+    if (expiredCards > 0) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'member', '会员卡集中到期',
+          `日结扫描发现 ${expiredCards} 张会员卡已过有效期，已自动降级为普通会员（积分与储值余额保留）。会员专员可跟进续费转化。`, 0, 'resolved')
+    }
     day += 1
     setSetting('day', day)
   }
@@ -577,6 +624,9 @@ function tick() {
 
   // 需求侧：模拟游客为未来三天的入园/设施时段下单预约（预收款即入账）
   autoBookDemand(allRides(), base, priceFactor, repFactor * complaintFactor)
+
+  // 会员经济：会员按卡等级折扣自助预约（复用预约事务/库存一致性）、商铺储值/券消费、散客办卡转化
+  autoMemberEconomy({ rides: ops, vendors })
 
   // 员工满意度
   const sm = db.prepare('UPDATE staff SET morale=? WHERE id=?')
@@ -739,6 +789,12 @@ app.get('/api/state', (req, res) => {
     reservationStats: reservationStats(),
     entrySlots: listSlots({ scope: 'entry' }),
     reservations: listReservations({ limit: 100 }),
+    // 会员与权益中心
+    memberConfig: getConfig(),
+    memberStats: memberStats(),
+    members: listMembers({ limit: 200 }),
+    cardProducts: listCardProducts(),
+    benefitProducts: listBenefitProducts(),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -883,12 +939,12 @@ app.delete('/api/vendors/:id', (req, res) => {
 })
 
 // ---- 员工 ----
-const ROLES = ['保安', '保洁', '维修']
+const ROLES = ['保安', '保洁', '维修', '会员专员']
 app.post('/api/staff', (req, res) => {
   const b = req.body || {}
   const role = b.role || '保安'
   if (!ROLES.includes(role)) return res.status(400).json({ ok: false, msg: '非法岗位' })
-  const wage = role === '维修' ? 380 : role === '保洁' ? 300 : 320
+  const wage = role === '维修' ? 380 : role === '会员专员' ? 340 : role === '保洁' ? 300 : 320
   const r = db.prepare('INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES(?,?,?,?,?,?,?)')
     .run(b.name || `新员工`, role, num(b.zone_id, 1), wage, 1, 80, 1)
   res.json({ ok: true, id: Number(r.lastInsertRowid) })
@@ -1028,8 +1084,14 @@ app.post('/api/complaints', (req, res) => {
   if (b.target_type === 'ride') { const r = allRides().find(x => x.id === num(b.target_id)); if (r) target = { type: 'ride', id: r.id, name: r.name } }
   else if (b.target_type === 'vendor') { const v = allVendors().find(x => x.id === num(b.target_id)); if (v) target = { type: 'vendor', id: v.id, name: v.name } }
   else if (b.target_type === 'zone') { const z = allZones().find(x => x.id === num(b.target_id)); if (z) target = { type: 'zone', id: z.id, name: z.name } }
+  // 会员本人投诉（可积分补偿结案）：校验会员档案
+  let memberId = null
+  if (b.member_id) {
+    const m = db.prepare('SELECT id FROM members WHERE id=?').get(num(b.member_id))
+    if (m) memberId = m.id
+  }
   const title = `${COMPLAINT_CATS[category].name}投诉 · ${target.name || '园区整体'}`
-  const r = createComplaint({ category, severity, title, content, target, source: 'manual' })
+  const r = createComplaint({ category, severity, title, content, target, source: 'manual', memberId })
   res.json({ ok: true, ...r })
 })
 
@@ -1159,6 +1221,8 @@ app.post('/api/reservations', (req, res) => {
     guest_name: String(b.guest_name || '').trim(),
     guest_phone: String(b.guest_phone || '').trim(),
     source: b.source === 'manual' ? 'manual' : 'guest',
+    memberId: b.member_id ? num(b.member_id) : null,
+    benefitId: b.benefit_id ? num(b.benefit_id) : null,
     requestId: idemKey(req)
   })
   reply(req, res, r)
@@ -1185,6 +1249,123 @@ app.get('/api/reservations/:id', (req, res) => {
   const list = listReservations({ limit: 5000 }).filter(x => x.id === id)
   if (!list.length) return res.status(404).json({ ok: false })
   res.json({ reservation: list[0], logs: reservationLogs(id) })
+})
+
+// ---- 游客会员与权益中心 ----
+app.get('/api/members', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listMembers({ tier: q.tier || null, status: q.status || null, q: q.q || '', limit: 300 }),
+    stats: memberStats(),
+    config: getConfig(),
+    cards: listCardProducts(),
+    benefits: listBenefitProducts()
+  })
+})
+
+app.get('/api/members/:id', (req, res) => {
+  const d = memberDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '会员不存在' })
+  res.json(d)
+})
+
+// 前台注册会员
+app.post('/api/members', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, registerMember({
+    name: String(b.name || '').trim(),
+    phone: String(b.phone || '').trim(),
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }), 201)
+})
+
+// 会员核价预览（预约页选会员/权益时调用）：返回折后价与积分预估，不落库
+app.post('/api/members/:id/quote', (req, res) => {
+  const b = req.body || {}
+  const m = db.prepare('SELECT id FROM members WHERE id=?').get(num(req.params.id))
+  if (!m) return res.status(404).json({ ok: false, code: 'MEMBER_NOT_FOUND', msg: '会员不存在' })
+  const ride = b.scope === 'ride' ? db.prepare('SELECT price FROM rides WHERE id=?').get(num(b.ride_id)) : null
+  const q = memberQuote(num(req.params.id), {
+    scope: b.scope === 'ride' ? 'ride' : 'entry',
+    rideId: num(b.ride_id) || null,
+    qty: num(b.qty, 1),
+    benefitId: b.benefit_id ? num(b.benefit_id) : null,
+    entryPrice: state.ticket(),
+    ridePrice: ride?.price ?? 30
+  })
+  reply(req, res, q)
+})
+
+// 购卡 / 续费 / 升级（幂等）
+app.post('/api/members/:id/cards/:tier', (req, res) => {
+  const b = req.body || {}
+  const tier = ['silver', 'gold', 'diamond'].includes(req.params.tier) ? req.params.tier : ''
+  if (!tier) return res.status(400).json({ ok: false, code: 'CARD_NOT_FOUND', msg: '卡种无效', reqId: req.reqId })
+  reply(req, res, applyCard(num(req.params.id), tier, {
+    requestId: idemKey(req),
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+
+// 储值充值（幂等）
+app.post('/api/members/:id/topup', (req, res) => {
+  reply(req, res, topup(num(req.params.id), num(req.body?.amount), {
+    requestId: idemKey(req),
+    staffId: req.body?.staff_id ? num(req.body.staff_id) : null
+  }))
+})
+
+// 积分兑换权益（幂等）
+app.post('/api/members/:id/redeem/:code', (req, res) => {
+  reply(req, res, redeemPoints(num(req.params.id), String(req.params.code), { requestId: idemKey(req) }))
+})
+
+// 会员现场购优惠票（直接入园，不走预约；幂等）
+app.post('/api/members/:id/tickets', (req, res) => {
+  reply(req, res, buyEntryTicket(num(req.params.id), num(req.body?.qty, 1), { requestId: idemKey(req) }))
+})
+
+// 会员商铺消费：现金 / 储值 / 消费券
+app.post('/api/members/:id/vendors/:vendorId/spend', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, vendorSpend(num(req.params.id), num(req.params.vendorId), {
+    payMethod: ['cash', 'balance', 'voucher'].includes(b.pay_method) ? b.pay_method : 'cash',
+    benefitId: b.benefit_id ? num(b.benefit_id) : null,
+    qty: num(b.qty, 1)
+  }))
+})
+
+// 冻结 / 解冻
+app.post('/api/members/:id/freeze', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, setFrozen(num(req.params.id), b.frozen !== false, {
+    reason: String(b.reason || '').slice(0, 100),
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+
+// 运营手动调整积分
+app.post('/api/members/:id/points', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, adjustPoints(num(req.params.id), num(b.change), {
+    note: String(b.note || '').slice(0, 100),
+    staffId: b.staff_id ? num(b.staff_id) : null
+  }))
+})
+
+// 归属运营人员（会员专员）
+app.post('/api/members/:id/owner', (req, res) => {
+  reply(req, res, setOwner(num(req.params.id), req.body?.staff_id ? num(req.body.staff_id) : null))
+})
+
+// 会员中心运营配置：积分倍率 / 积分补偿档 / 权益有效期 / 体系开关
+app.post('/api/member-config', (req, res) => {
+  reply(req, res, saveConfig(req.body || {}))
+})
+
+// 卡种运营配置（价格/有效期/折扣/赠送/上下架）
+app.post('/api/card-products/:tier', (req, res) => {
+  reply(req, res, updateCardProduct(String(req.params.tier), req.body || {}))
 })
 
 // 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）

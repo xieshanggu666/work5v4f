@@ -7,6 +7,7 @@ import RidesView from '@/components/RidesView.vue'
 import VendorsView from '@/components/VendorsView.vue'
 import StaffView from '@/components/StaffView.vue'
 import TicketView from '@/components/TicketView.vue'
+import MembersView from '@/components/MembersView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
@@ -22,6 +23,7 @@ const navs = [
   { k: 'vendors', icon: '🏪', label: '商铺' },
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
+  { k: 'members', icon: '💎', label: '会员权益' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
@@ -62,6 +64,7 @@ onMounted(store.refresh)
           <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
           <span class="halo" v-if="store.maintenanceStats.queued">🛠️ {{ store.maintenanceStats.queued }} 张检修工单待接单</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
+          <span class="halo" v-if="store.memberStats.expiring">💳 {{ store.memberStats.expiring }} 张会员卡即将到期</span>
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
@@ -78,6 +81,7 @@ onMounted(store.refresh)
         <VendorsView v-else-if="view === 'vendors'" />
         <StaffView v-else-if="view === 'staff'" />
         <TicketView v-else-if="view === 'ticket'" />
+        <MembersView v-else-if="view === 'members'" />
         <ReservationsView v-else-if="view === 'reservations'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
