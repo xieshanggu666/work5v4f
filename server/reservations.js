@@ -1,4 +1,5 @@
 import db, { getSetting, setSetting, tx } from './db.js'
+import { memberPricing, onReservationBooked, onReservationRefund } from './members.js'
 
 // 分时预约模块：入园时段 9:00~18:00；设施时段 9:00~17:00（末班需留出运行时间）
 const OPEN_HOUR = 9
@@ -173,7 +174,7 @@ function forceRefundByPark(rows, note, complaintInfo = {}) {
 // ---------------- 下单 / 改签 / 退款 ----------------
 // 核心一致性：建单+扣库存+预收款+流水+日志在同一事务提交；库存用条件更新原子扣减，
 // 容量不足/时段关闭时条件更新命中 0 行 → 抛 TxError 整体回滚，不留半完成状态
-function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, source }) {
+function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, source, memberId = null }) {
   return runAtomic(() => {
     // 库存原子校验+扣减：仅当时段开放且余量（容量+超售额度）充足才占用
     const claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
@@ -185,19 +186,21 @@ function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, s
       throw new TxError(RSV_ERR.SLOT_FULL,
         `该时段余量不足，仅剩 ${Math.max(0, cur.remain)} 个名额${cur.oversell > 0 ? `（含 ${cur.oversell} 超售额度）` : ''}`)
     }
-    const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,created_tick,created_day)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?)`)
+    const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,member_id,created_tick,created_day)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?,?)`)
       .run('', guest_name || '游客', guest_phone || '', scope, rideId, slot.id, slot.day, slot.hour,
-           qty, amount, source || 'guest', ctx.tick(), ctx.day())
+           qty, amount, source || 'guest', memberId, ctx.tick(), ctx.day())
     const id = Number(result.lastInsertRowid)
     const code = 'YY' + String(id).padStart(4, '0')
     db.prepare('UPDATE reservations SET code=? WHERE id=?').run(code, id)
     // 预收款即时入账（现金制：下单即确认收入，核销不重复收费）
     setSetting('cash', Math.round(ctx.cash() + amount))
     ctx.logFinance?.(ctx.day(), scope === 'entry' ? '门票' : '游乐', amount,
-      `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人`)
+      `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人${memberId ? ' · 会员价' : ''}`)
     logReservation(id, source === 'auto' ? 'auto_book' : 'create',
       `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}`)
+    // 会员联动：按实付金额累积积分与成长值（同事务）
+    if (memberId) onReservationBooked({ id, code, member_id: memberId, amount })
     return { ok: true, id, code }
   })
 }
@@ -205,8 +208,11 @@ function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, s
 // 退款核心逻辑（不包事务）：状态条件更新（仅 booked 可退，防重复退款）→ 退现金/记流水 → 释放库存。
 // 失败抛 TxError 由调用方处置：批量场景（forceRefundByPark）直接传播触发外层整体回滚；
 // 单退场景由 refundReservation 包一层 runAtomic 独立事务。reason=park/overbook 全额；late 半价
+// 会员联动：黄金及以上等级当日取消免手续费；退款扣回消费积分，园方原因追加补偿积分
 function refundOne(rsv, reason, note, opts = {}) {
-  const half = reason === 'late'
+  // 会员退票权益：黄金/黑钻会员当日取消免手续费（全额退）
+  const waiveFee = reason === 'late' && rsv.member_id && (memberPricing(rsv.member_id).lateRefundFree === true)
+  const half = reason === 'late' && !waiveFee
   const back = half ? Math.round(rsv.amount * (1 - LATE_CANCEL_FEE)) : rsv.amount
   const fee = rsv.amount - back
 
@@ -219,7 +225,7 @@ function refundOne(rsv, reason, note, opts = {}) {
   if (back > 0) {
     setSetting('cash', Math.round(ctx.cash() - back))
     const label = rsv.scope === 'entry' ? '门票' : '游乐'
-    ctx.logFinance?.(ctx.day(), label, -back, `预约退款 ${rsv.code}${half ? '（当日取消扣 50% 手续费）' : ''}`)
+    ctx.logFinance?.(ctx.day(), label, -back, `预约退款 ${rsv.code}${half ? '（当日取消扣 50% 手续费）' : waiveFee ? '（会员免手续费）' : ''}`)
   }
   if (fee > 0) ctx.logFinance?.(ctx.day(), '违约', fee, `预约 ${rsv.code} 取消费/爽约没收`)
 
@@ -227,7 +233,10 @@ function refundOne(rsv, reason, note, opts = {}) {
   db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?), refund_count=refund_count+? WHERE id=?')
     .run(rsv.qty, rsv.qty, rsv.slot_id)
   logReservation(rsv.id, half ? 'cancel' : 'refund',
-    `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}`)
+    `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}${waiveFee ? '（会员免手续费）' : ''}`)
+
+  // 会员联动：扣回本单消费积分；园方原因退款追加补偿积分（同事务）
+  if (rsv.member_id) onReservationRefund({ ...rsv, member_id: rsv.member_id }, reason)
 
   if (!opts.skipComplaint && reason === 'overbook' && ctx.createComplaint) {
     const ride = rsv.ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rsv.ride_id) : null
@@ -572,9 +581,16 @@ export function listReservations({ status = null, scope = null, day = null, limi
   if (day) { conds.push('slot_day=?'); vals.push(num(day)) }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : ''
   const rows = db.prepare(`SELECT * FROM reservations ${where} ORDER BY id DESC LIMIT ?`).all(...vals, num(limit, 120))
+  const memberIds = [...new Set(rows.map(r => r.member_id).filter(Boolean))]
+  const memberMap = new Map(memberIds.map(id => {
+    const m = db.prepare('SELECT id,code,name,tier FROM members WHERE id=?').get(id)
+    return [id, m]
+  }))
   return rows.map(r => ({
     ...r,
     ride_name: r.ride_id ? (rides.find(x => x.id === r.ride_id)?.name || `设施#${r.ride_id}`) : '',
+    member_code: r.member_id ? (memberMap.get(r.member_id)?.code || '') : '',
+    member_name: r.member_id ? (memberMap.get(r.member_id)?.name || '') : '',
     scope_name: r.scope === 'entry' ? '分时入园' : '设施预约',
     status_name: STATUS_NAMES[r.status] || r.status
   }))
@@ -591,7 +607,8 @@ export function reservationLogs(id) {
 }
 
 // 游客端下单校验入口；requestId 幂等：同一请求号重复提交（双击/重试/刷新重发）只建一单、只收一次款
-export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest', requestId = '' }) {
+// 会员联动：携带 member_id/member_code 时按等级折扣计价，建单累积积分，退款扣回/补偿
+export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest', requestId = '', memberId = null, memberCode = '' }) {
   return idempotent('create', requestId, () => {
     const slot = getSlot(num(slotId))
     if (!slot) return fail(RSV_ERR.SLOT_NOT_FOUND, '时段不存在')
@@ -604,9 +621,24 @@ export function createReservation({ scope, rideId, slotId, qty, guest_name, gues
     const q = Math.max(1, Math.min(20, Math.round(num(qty, 1))))
     const ride = scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(slot.ride_id) : null
     if (scope === 'ride' && (!ride || ride.status !== 'operating')) return fail(RSV_ERR.RIDE_UNAVAILABLE, '该设施当前不开放预约')
+
+    // 会员识别与等级折扣
+    let mid = null
+    let disc = 1
+    if (memberId || memberCode) {
+      const m = memberId
+        ? db.prepare('SELECT * FROM members WHERE id=?').get(num(memberId))
+        : db.prepare('SELECT * FROM members WHERE code=?').get(String(memberCode).trim())
+      if (!m) return fail('MBR_NOT_FOUND', '会员不存在，请核对会员号')
+      const pricing = memberPricing(m.id)
+      if (!pricing.ok) return fail('MBR_FROZEN', pricing.msg || '会员状态异常，无法享受会员权益')
+      mid = m.id
+      disc = scope === 'entry' ? pricing.ticketDisc : pricing.rideDisc
+    }
+
     const price = scope === 'entry' ? entryPrice() : ridePrice(ride)
-    const amount = q * price
-    return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source })
+    const amount = Math.round(q * price * disc)
+    return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source, memberId: mid })
   })
 }
 

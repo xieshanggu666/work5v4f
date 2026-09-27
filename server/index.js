@@ -13,6 +13,12 @@ import {
   cancelOrdersByRide, releaseStaffOrders, listMaintenanceOrders,
   maintenanceOrderDetail, maintenanceStats, staffLoad
 } from './maintenance.js'
+import {
+  initMemberContext, TIERS, listMembers, memberDetail, memberStats,
+  listCards, createCard, updateCard, enrollMember, purchaseCard, refundCard,
+  adjustPoints, setMemberStatus, dailyMemberSettlement, simulateMemberActivity,
+  recentMemberLogs
+} from './members.js'
 
 const app = express()
 app.use(express.json())
@@ -73,6 +79,12 @@ initMaintenanceContext({
   logFinance,
   syncRideSlots: (ride) => syncRideSlots(ride),
   linkComplaintsToRide: (rideId, staffId) => linkComplaintsToRide(rideId, staffId)
+})
+
+// 会员与权益中心共享：时钟 / 现金 / 财务流水 / 投诉建单
+initMemberContext({
+  logFinance,
+  createComplaint: (payload) => createComplaint(payload)
 })
 
 // ---------------- 分期贷款 ----------------
@@ -167,8 +179,8 @@ const COMPLAINT_CATS = {
   facility: { name: '设施故障', icon: '🛠️', roles: ['维修'] },
   safety:   { name: '安全隐患', icon: '🚨', roles: ['保安', '安保'] },
   food:     { name: '餐饮质量', icon: '🍔', roles: ['保洁'] },
-  service:  { name: '服务态度', icon: '💁', roles: [] },      // 无专属岗位，任何员工均可受理
-  pricing:  { name: '价格争议', icon: '💰', roles: [] },
+  service:  { name: '服务态度', icon: '💁', roles: ['客服'] },      // 客服专员受理最匹配，其他员工也可处理
+  pricing:  { name: '价格争议', icon: '💰', roles: ['客服'] },
   missing:  { name: '物品遗失', icon: '🎒', roles: ['保安', '安保'] }
 }
 
@@ -452,7 +464,10 @@ function complaintStats() {
 function tick() {
   let day = state.day()
   let hour = state.hour() + 1
-  let cash = state.cash()
+  // 现金采用「期初快照 + 净变动合并」：本循环内各模块（预约/会员）直接读写 settings 现金，
+  // 末尾仅叠加本循环自身的净变动，避免覆盖模块在循环中途的入账/退款
+  const cashStart = state.cash()
+  let cash = cashStart
   let rep = state.reputation()
   const ticket = state.ticket()
   const base = state.guestBase()
@@ -480,6 +495,8 @@ function tick() {
     overdueIds = settled.overdueIds
     day += 1
     setSetting('day', day)
+    // 会员日结：成长值衰减 → 等级升/降流转；卡到期权益失效；客服承载不足 → 会员服务投诉
+    dailyMemberSettlement(day)
   }
   setSetting('hour', hour)
 
@@ -578,6 +595,9 @@ function tick() {
   // 需求侧：模拟游客为未来三天的入园/设施时段下单预约（预收款即入账）
   autoBookDemand(allRides(), base, priceFactor, repFactor * complaintFactor)
 
+  // 会员与权益中心：新会员注册、会员购卡、会员到店消费（折让/积分抵现为园方成本，消费累积积分与成长值）
+  simulateMemberActivity(entering, avgSpend)
+
   // 员工满意度
   const sm = db.prepare('UPDATE staff SET morale=? WHERE id=?')
   allStaff().forEach(s => {
@@ -624,7 +644,7 @@ function tick() {
   const womNow = state.wordOfMouth()
   if (womNow !== 0) setSetting('wordOfMouth', Math.round(womNow * 0.98 * 100) / 100)
 
-  setSetting('cash', Math.round(cash))
+  setSetting('cash', Math.round(num(getSetting('cash')) + (cash - cashStart)))
   setSetting('reputation', Math.round(rep * 10) / 10)
 
   // 随机事件
@@ -739,6 +759,10 @@ app.get('/api/state', (req, res) => {
     reservationStats: reservationStats(),
     entrySlots: listSlots({ scope: 'entry' }),
     reservations: listReservations({ limit: 100 }),
+    members: listMembers({ limit: 120 }),
+    memberCards: listCards(),
+    memberStats: memberStats(),
+    memberTiers: TIERS,
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -883,12 +907,12 @@ app.delete('/api/vendors/:id', (req, res) => {
 })
 
 // ---- 员工 ----
-const ROLES = ['保安', '保洁', '维修']
+const ROLES = ['保安', '保洁', '维修', '客服']
 app.post('/api/staff', (req, res) => {
   const b = req.body || {}
   const role = b.role || '保安'
   if (!ROLES.includes(role)) return res.status(400).json({ ok: false, msg: '非法岗位' })
-  const wage = role === '维修' ? 380 : role === '保洁' ? 300 : 320
+  const wage = role === '维修' ? 380 : role === '保洁' ? 300 : role === '客服' ? 340 : 320
   const r = db.prepare('INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES(?,?,?,?,?,?,?)')
     .run(b.name || `新员工`, role, num(b.zone_id, 1), wage, 1, 80, 1)
   res.json({ ok: true, id: Number(r.lastInsertRowid) })
@@ -1147,7 +1171,7 @@ app.get('/api/reservations', (req, res) => {
   })
 })
 
-// 游客下单：按日期 + 时段预约入园或设施（幂等：request_id 防重复提交）
+// 游客下单：按日期 + 时段预约入园或设施（幂等：request_id 防重复提交）；可携会员号享等级折扣
 app.post('/api/reservations', (req, res) => {
   const b = req.body || {}
   const scope = b.scope === 'ride' ? 'ride' : 'entry'
@@ -1159,6 +1183,7 @@ app.post('/api/reservations', (req, res) => {
     guest_name: String(b.guest_name || '').trim(),
     guest_phone: String(b.guest_phone || '').trim(),
     source: b.source === 'manual' ? 'manual' : 'guest',
+    memberCode: String(b.member_code || '').trim(),
     requestId: idemKey(req)
   })
   reply(req, res, r)
@@ -1186,6 +1211,78 @@ app.get('/api/reservations/:id', (req, res) => {
   if (!list.length) return res.status(404).json({ ok: false })
   res.json({ reservation: list[0], logs: reservationLogs(id) })
 })
+
+// ---- 游客会员与权益中心 ----
+// 会员名录（可按状态/等级/关键词过滤）
+app.get('/api/members', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listMembers({
+      status: q.status || null,
+      tier: q.tier !== undefined && q.tier !== '' ? num(q.tier) : null,
+      q: String(q.q || '').trim(),
+      limit: q.limit ? num(q.limit) : 200
+    }),
+    stats: memberStats(),
+    tiers: TIERS
+  })
+})
+
+// 会员详情：基础信息 + 购卡订单 + 积分流水 + 等级流转
+app.get('/api/members/:id', (req, res) => {
+  const d = memberDetail(num(req.params.id))
+  if (!d) return res.status(404).json({ ok: false, msg: '会员不存在' })
+  res.json(d)
+})
+
+// 前台登记会员（手动建卡）
+app.post('/api/members', (req, res) => {
+  const b = req.body || {}
+  const name = String(b.name || '').trim()
+  if (!name) return res.status(400).json({ ok: false, msg: '请填写会员姓名' })
+  reply(req, res, enrollMember({ name, phone: String(b.phone || '').trim(), source: 'manual' }))
+})
+
+// 购卡/续卡（幂等：request_id 防重复扣款；续卡自原到期日顺延）
+app.post('/api/members/:id/purchase', (req, res) => {
+  reply(req, res, purchaseCard(num(req.params.id), num(req.body?.card_id), idemKey(req), 'manual'))
+})
+
+// 退卡：按剩余天数比例退款（20% 手续费），积分清零，等级回落（幂等）
+app.post('/api/members/:id/refund-card', (req, res) => {
+  reply(req, res, refundCard(num(req.params.id), idemKey(req)))
+})
+
+// 运营调账：积分补发/扣减（幂等）
+app.post('/api/members/:id/adjust-points', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, adjustPoints(num(req.params.id), num(b.delta), String(b.reason || '').trim(), idemKey(req)))
+})
+
+// 冻结 / 解冻
+app.post('/api/members/:id/status', (req, res) => {
+  const action = req.body?.action === 'freeze' ? 'freeze' : 'unfreeze'
+  reply(req, res, setMemberStatus(num(req.params.id), action))
+})
+
+// 卡种配置：列表 / 新增 / 调价·赠分·上下架
+app.get('/api/member-cards', (req, res) => res.json({ list: listCards(), tiers: TIERS }))
+app.post('/api/member-cards', (req, res) => {
+  const b = req.body || {}
+  reply(req, res, createCard({
+    name: String(b.name || '').trim(),
+    price: num(b.price),
+    valid_days: num(b.valid_days),
+    grant_tier: num(b.grant_tier, 1),
+    bonus_points: num(b.bonus_points)
+  }))
+})
+app.post('/api/member-cards/:id', (req, res) => {
+  reply(req, res, updateCard(num(req.params.id), req.body || {}))
+})
+
+// 全局积分流水与等级流转（会员中心流水页签）
+app.get('/api/member-logs', (req, res) => res.json(recentMemberLogs(60)))
 
 // 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）
 app.use((err, req, res, _next) => {

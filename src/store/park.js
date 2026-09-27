@@ -30,6 +30,16 @@ function emptyReservationStats() {
   }
 }
 
+function emptyMemberStats() {
+  return {
+    total: 0, active: 0, frozen: 0, cardHolders: 0, todayNew: 0,
+    tierDist: [], pointsOut: 0, pointsUsed: 0, pointsLive: 0,
+    cardRevToday: 0, cardsToday: 0, refundToday: 0,
+    staffCount: 0, staffCapacity: 0,
+    activity: { enrolled: 0, cardsSold: 0, visits: 0, spend: 0, discountCost: 0, redeemValue: 0 }
+  }
+}
+
 export const useParkStore = defineStore('park', {
   state: () => ({
     data: null,
@@ -59,7 +69,11 @@ export const useParkStore = defineStore('park', {
     reservations: s => s.data?.reservations || [],
     reservationStats: s => s.data?.reservationStats || emptyReservationStats(),
     openComplaints: s => (s.data?.complaints || []).filter(c => ['open', 'processing', 'ready'].includes(c.status)),
-    activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active')
+    activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active'),
+    members: s => s.data?.members || [],
+    memberCards: s => s.data?.memberCards || [],
+    memberStats: s => s.data?.memberStats || emptyMemberStats(),
+    memberTiers: s => s.data?.memberTiers || []
   },
   actions: {
     async refresh() {
@@ -104,6 +118,16 @@ export const useParkStore = defineStore('park', {
     // 设施检修工单
     assignMaintenance(id, staff_id) { return this.api('POST', `/maintenance/${id}/assign`, { staff_id }) },
     cancelMaintenance(id) { return this.api('POST', `/maintenance/${id}/cancel`, {}) },
-    async maintenanceDetail(id) { return j('GET', `/maintenance/${id}`) }
+    async maintenanceDetail(id) { return j('GET', `/maintenance/${id}`) },
+    // 会员与权益中心（写操作携带 request_id 幂等键）
+    enrollMember(payload) { return this.api('POST', '/members', payload) },
+    purchaseCard(id, card_id, request_id) { return this.api('POST', `/members/${id}/purchase`, { card_id, request_id }) },
+    refundCard(id, request_id) { return this.api('POST', `/members/${id}/refund-card`, { request_id }) },
+    adjustPoints(id, delta, reason, request_id) { return this.api('POST', `/members/${id}/adjust-points`, { delta, reason, request_id }) },
+    setMemberStatus(id, action) { return this.api('POST', `/members/${id}/status`, { action }) },
+    createMemberCard(payload) { return this.api('POST', '/member-cards', payload) },
+    updateMemberCard(id, payload) { return this.api('POST', `/member-cards/${id}`, payload) },
+    async memberDetail(id) { return j('GET', `/members/${id}`) },
+    async memberLogs() { return j('GET', '/member-logs') }
   }
 })

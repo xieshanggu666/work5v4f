@@ -36,13 +36,14 @@ const pickDay = computed(() => today.value + dayOffset.value)
 const dayOffset = ref(0)
 const qty = ref(2)
 const guestName = ref('')
+const memberCode = ref('')           // 会员号（选填）：享等级折扣，消费累积积分
 const bookMsg = ref(null)          // { text, ok }
 const booking = ref(false)         // 提交中：禁用按钮防双击
 const selectedSlot = ref(null)
 // 当前下单意图的幂等键：同一意图的重试/双击复用；意图变化或下单成功后换新键
 const bookReqId = ref(newRequestId())
-// 表单意图一变（时段/日期/类型/设施/人数），旧请求号作废，避免误命中上一次提交结果
-watch([scope, pickRide, dayOffset, selectedSlot, qty], () => { bookReqId.value = newRequestId() })
+// 表单意图一变（时段/日期/类型/设施/人数/会员号），旧请求号作废，避免误命中上一次提交结果
+watch([scope, pickRide, dayOffset, selectedSlot, qty, memberCode], () => { bookReqId.value = newRequestId() })
 
 const rideSlotsMap = ref({})   // rideId -> slots
 const rideSlotsLoading = ref(false)
@@ -73,7 +74,21 @@ const rideSlotsByDay = computed(() => {
 const slotsForDay = computed(() => scope.value === 'entry' ? entrySlotsByDay.value : rideSlotsByDay.value)
 const chosenRide = computed(() => store.rides.find(r => r.id === pickRide.value))
 const unitPrice = computed(() => scope.value === 'entry' ? +store.ticket : (chosenRide.value?.price ?? 0))
-const totalPrice = computed(() => unitPrice.value * qty.value)
+// 会员等级折扣（与后端 TIERS 一致的前端预估，实际以后端结算为准）
+const memberDisc = computed(() => {
+  const code = memberCode.value.trim()
+  if (!code) return 1
+  const m = store.members.find(x => x.code === code)
+  if (!m || m.status !== 'active') return 1
+  const t = store.memberTiers.find(x => x.level === m.tier)
+  if (!t) return 1
+  return scope.value === 'entry' ? t.ticketDisc : t.rideDisc
+})
+const memberMatched = computed(() => {
+  const code = memberCode.value.trim()
+  return code ? store.members.find(x => x.code === code) : null
+})
+const totalPrice = computed(() => Math.round(unitPrice.value * qty.value * memberDisc.value))
 
 function pickSlot(s) { selectedSlot.value = s }
 function onScopeChange() { selectedSlot.value = null; if (scope.value === 'ride' && !pickRide.value && store.rides.length) pickRide.value = store.rides.find(r => r.status === 'operating')?.id || 0 }
@@ -99,6 +114,7 @@ async function submitBook() {
       slot_id: selectedSlot.value.id,
       qty: qty.value,
       guest_name: guestName.value,
+      member_code: memberCode.value.trim() || undefined,
       request_id: bookReqId.value                 // 幂等键：重试/双击不会重复下单扣款
     })
     if (r?.ok) {
@@ -274,6 +290,13 @@ function pickDayIf(off) { return today.value + off }
           </div>
         </label>
         <label class="fld">游客姓名（选填）<input v-model="guestName" placeholder="如：王**" maxlength="12" /></label>
+        <label class="fld">会员号（选填，享等级折扣）
+          <input v-model="memberCode" placeholder="如：M0001" maxlength="10" />
+          <em class="mhit" v-if="memberMatched">
+            {{ memberMatched.tier_icon }} {{ memberMatched.tier_name }} · {{ scope === 'entry' ? '门票' : '游乐' }} {{ Math.round(memberDisc * 100) }}%
+            · 消费累积积分
+          </em>
+        </label>
         <label class="fld">人数
           <div class="stepper">
             <button type="button" @click="qty = Math.max(1, qty - 1)">－</button>
@@ -283,8 +306,10 @@ function pickDayIf(off) { return today.value + off }
         </label>
         <div class="quote">
           <span>{{ scope === 'entry' ? '门票单价' : '设施票价' }} <b class="money">¥{{ unitPrice }}</b> / 人</span>
-          <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b></span>
-          <em class="muted">提前取消全额退；当日取消退 50%；爽约不退。预约费用下单即收取。</em>
+          <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b>
+            <em v-if="memberDisc < 1" class="muted">（会员价，已省 ¥{{ (unitPrice * qty - totalPrice).toLocaleString() }}）</em>
+          </span>
+          <em class="muted">提前取消全额退；当日取消退 50%（黄金及以上会员免手续费）；爽约不退。预约费用下单即收取。</em>
         </div>
         <button class="primary wide" :disabled="!selectedSlot || booking" @click="submitBook">
           {{ booking ? '提交中…' : selectedSlot ? `预约 第${selectedSlot.day}天 ${selectedSlot.hour}:00 · ¥${totalPrice.toLocaleString()}` : '请先选择时段' }}
@@ -389,6 +414,7 @@ function pickDayIf(off) { return today.value + off }
               <b>{{ r.code }}</b>
               <span class="badge" :class="statusBadge(r.status).cls">{{ statusBadge(r.status).text }}</span>
               <span class="tag">{{ r.scope_name }}</span>
+              <span class="tag mbr" v-if="r.member_code">💳 {{ r.member_code }}</span>
             </div>
             <div class="meta">
               {{ r.scope === 'ride' ? `🎢 ${r.ride_name} · ` : '🏞️ ' }}
@@ -481,6 +507,8 @@ function pickDayIf(off) { return today.value + off }
 .stepper b { font-size: 18px; min-width: 24px; text-align: center; }
 .quote { background: var(--panel2); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; margin-bottom: 12px; }
 .quote em { font-size: 11px; line-height: 1.5; }
+.mhit { font-style: normal; font-size: 11.5px; color: var(--accent2); }
+.tag.mbr { color: var(--accent2); border-color: rgba(255,209,102,.4); }
 .wide { width: 100%; padding: 11px; }
 .bookmsg { display: block; margin-top: 10px; font-size: 12.5px; color: var(--green); font-style: normal; }
 .bookmsg.err { color: var(--red); }

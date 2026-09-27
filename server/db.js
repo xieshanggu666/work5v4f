@@ -255,6 +255,84 @@ CREATE TABLE IF NOT EXISTS maintenance_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_maint_logs_oid ON maintenance_logs(order_id);
 
+-- 会员卡种：运营可配置的售卡商品（购卡即享等级权益 + 开卡赠积分）
+CREATE TABLE IF NOT EXISTS member_cards (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,                  -- 月卡/季卡/年卡…
+  price INTEGER NOT NULL,              -- 售价
+  valid_days INTEGER NOT NULL,         -- 有效天数(游戏日)
+  grant_tier INTEGER NOT NULL DEFAULT 1, -- 持卡期间授予的会员等级 1白银/2黄金/3黑钻
+  bonus_points INTEGER NOT NULL DEFAULT 0, -- 开卡赠积分
+  active INTEGER NOT NULL DEFAULT 1,   -- 1 上架 / 0 下架
+  created_day INTEGER NOT NULL DEFAULT 1
+);
+
+-- 游客会员：等级=成长值等级与持卡等级取高；成长值每日衰减驱动降级流转
+CREATE TABLE IF NOT EXISTS members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',        -- 会员号 M0001
+  name TEXT NOT NULL DEFAULT '会员',
+  phone TEXT NOT NULL DEFAULT '',
+  tier INTEGER NOT NULL DEFAULT 0,      -- 0普通/1白银/2黄金/3黑钻
+  points INTEGER NOT NULL DEFAULT 0,    -- 可用积分
+  growth INTEGER NOT NULL DEFAULT 0,    -- 成长值（消费累积，每日衰减，决定成长等级）
+  total_spend INTEGER NOT NULL DEFAULT 0,
+  card_id INTEGER,                      -- 当前持有卡种
+  card_expire_day INTEGER NOT NULL DEFAULT 0,
+  card_status TEXT NOT NULL DEFAULT 'none', -- none/active/expired/refunded
+  status TEXT NOT NULL DEFAULT 'active',    -- active/frozen（冻结不可积分/购卡）
+  source TEXT NOT NULL DEFAULT 'auto',      -- manual 前台登记 / auto 模拟注册
+  last_visit_day INTEGER NOT NULL DEFAULT 0,
+  join_day INTEGER NOT NULL DEFAULT 1,
+  created_tick INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
+CREATE INDEX IF NOT EXISTS idx_members_tier ON members(tier);
+
+-- 购卡订单：售卡收入入账凭证；退卡按比例退款并留痕
+CREATE TABLE IF NOT EXISTS member_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',        -- 订单号 KA0001
+  member_id INTEGER NOT NULL,
+  card_id INTEGER NOT NULL,
+  card_name TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'done',  -- done/refunded
+  start_day INTEGER NOT NULL,
+  end_day INTEGER NOT NULL,             -- 卡到期日（续卡顺延累加）
+  refund_amount INTEGER NOT NULL DEFAULT 0,
+  created_tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  closed_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_morders_member ON member_orders(member_id);
+
+-- 积分流水：发放/抵现/扣回/补偿/调账/清零 全留痕，balance 为变动后余额
+CREATE TABLE IF NOT EXISTS member_points_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  delta INTEGER NOT NULL,               -- 正=发放 负=扣减
+  balance INTEGER NOT NULL,             -- 变动后余额
+  type TEXT NOT NULL,                   -- consume/card_bonus/redeem/clawback/compensate/adjust/clear
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mpoints_member ON member_points_logs(member_id);
+
+-- 等级流转日志：注册/升级/降级/购卡授予/卡到期/退卡 全轨迹
+CREATE TABLE IF NOT EXISTS member_tier_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  from_tier INTEGER NOT NULL,
+  to_tier INTEGER NOT NULL,
+  reason TEXT NOT NULL,                 -- enroll/upgrade/downgrade/card_grant/card_expire/card_refund
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mtier_member ON member_tier_logs(member_id);
+
 -- 幂等请求键：同一 scope+key 的重复请求（双击/重试/网络重发）直接返回首次执行结果，不产生重复副作用
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,6 +353,8 @@ function ensureColumn(table, col, ddl) {
 // 退款金额/手续费留痕：幂等重放与财务对账
 ensureColumn('reservations', 'refund_amount', "refund_amount INTEGER NOT NULL DEFAULT 0")
 ensureColumn('reservations', 'refund_fee', "refund_fee INTEGER NOT NULL DEFAULT 0")
+// 预约单关联会员：会员折扣/积分/免手续费联动
+ensureColumn('reservations', 'member_id', "member_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -381,6 +461,18 @@ function seed() {
   }
 }
 seed()
+
+// 卡种种子数据独立兜底（老库升级时同样补齐，可重复执行）
+function seedMemberCards() {
+  const c = db.prepare('SELECT COUNT(*) n FROM member_cards').get().n
+  if (c > 0) return
+  const ic = db.prepare('INSERT INTO member_cards(name,price,valid_days,grant_tier,bonus_points,active,created_day) VALUES(?,?,?,?,?,1,?)')
+  const day = Number(getSetting('day')) || 1
+  ic.run('月卡', 388, 30, 1, 200, day)      // 持卡享白银权益
+  ic.run('季卡', 988, 90, 2, 800, day)      // 持卡享黄金权益
+  ic.run('年卡', 2888, 365, 3, 3000, day)   // 持卡享黑钻权益
+}
+seedMemberCards()
 
 export default db
 export { now, getSetting, setSetting, tx }

@@ -8,6 +8,7 @@ import VendorsView from '@/components/VendorsView.vue'
 import StaffView from '@/components/StaffView.vue'
 import TicketView from '@/components/TicketView.vue'
 import ReservationsView from '@/components/ReservationsView.vue'
+import MembersView from '@/components/MembersView.vue'
 import EventsView from '@/components/EventsView.vue'
 import ComplaintsView from '@/components/ComplaintsView.vue'
 import ReportsView from '@/components/ReportsView.vue'
@@ -23,6 +24,7 @@ const navs = [
   { k: 'staff', icon: '👷', label: '员工管理' },
   { k: 'ticket', icon: '🎫', label: '票务定价' },
   { k: 'reservations', icon: '📅', label: '预约调度' },
+  { k: 'members', icon: '💳', label: '会员权益' },
   { k: 'events', icon: '🎆', label: '活动事件' },
   { k: 'complaints', icon: '🗂️', label: '投诉补救' },
   { k: 'reports', icon: '📈', label: '经营报表' }
@@ -79,6 +81,7 @@ onMounted(store.refresh)
         <StaffView v-else-if="view === 'staff'" />
         <TicketView v-else-if="view === 'ticket'" />
         <ReservationsView v-else-if="view === 'reservations'" />
+        <MembersView v-else-if="view === 'members'" />
         <EventsView v-else-if="view === 'events'" />
         <ComplaintsView v-else-if="view === 'complaints'" />
         <ReportsView v-else />
